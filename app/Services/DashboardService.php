@@ -4,6 +4,8 @@ namespace App\Services;
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Exception;
 
 class DashboardService {
     protected string $url;
@@ -16,8 +18,23 @@ class DashboardService {
     }
 
     public function index(Request $request) {
-        $user = session('userData');
+        
+        try {
+            $clientsResponse = Http::withoutVerifying()
+            ->withHeaders([
+                'apikey' => $this->key,
+                'Authorization' => 'Bearer ' . $this->key,
+            ])->get("{$this->url}/rest/v1/users", [
+                'select' => '*',
+                'role' => 'eq.' . "client",
+            ]);
 
-        return view('dashboard', compact('user'));
+            $clients = $clientsResponse->json();
+        } catch (\Exception $e) {
+            Log::warning("Failed to Fetch Clients: " . $e->getMessage());
+        }
+        
+
+        return view('Admin.dashboard', compact('clients'));
     }
 }

@@ -8,6 +8,24 @@
         
     </head>
     <body >
-        
+        <header>
+            <div>
+                <h2>Admin Portal</h2>
+            </div>
+            <form action="{{route('dashboard')}}" method="GET" id=clientContextForm>
+                <label for="client_select">Clients:</label>
+                <select name="client_id" id="client_select" onchange="this.form.submit()">
+                    <option value="">-- All Client Overview --</option>
+                    @foreach($clients ?? [] as $client)
+                    <option value="{{ $client['id'] }}" {{ (request('client_id')) == $client['id'] || session('active_client_id') == $client['id'] ? 'selected' : '' }}>
+                        {{ $client['name'] }} (TIN: {{ $client['tin'] }})
+                    </option>
+                    @endforeach
+                </select>
+            </form>
+        </header>
+
+        @if($clients && isset($summary))
+            
     </body>
 </html>
