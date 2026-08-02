@@ -17,7 +17,7 @@
                 <select name="client_id" id="client_select" onchange="this.form.submit()">
                     <option value="">-- All Client Overview --</option>
                     @foreach($clients ?? [] as $client)
-                    <option value="{{ $client['id'] }}" {{ (request('client_id')) == $client['id'] || session('active_client_id') == $client['id'] ? 'selected' : '' }}>
+                    <option value="{{ $client['id'] }}" {{ (string) (request('client_id')) == (string) $client['id'] || (string) ($activeClientId ?? '') === (string) $client['id'] ? 'selected' : '' }}>
                         {{ $client['name'] }} (TIN: {{ $client['tin'] }})
                     </option>
                     @endforeach
@@ -25,7 +25,19 @@
             </form>
         </header>
 
-        @if($clients && isset($summary))
-            
+        @if(!empty($activeClientId) && isset($summary))
+            <div>
+                <p>Gross Sales: </p>
+                <p>₱{{number_format($summary['totalSales'], 2)}}</p>
+            </div>
+            <div>
+                <p>Net of VAT: </p>
+                <p>₱{{number_format($summary['totalNet'], 2)}}</p>
+            </div>
+            <div>
+                <p>Output VAT:</p>
+                <p>₱{{number_format($summary['outputVat'], 2)}}</p>
+            </div>
+        @endif
     </body>
 </html>
