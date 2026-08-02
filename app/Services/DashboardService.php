@@ -5,6 +5,7 @@ namespace App\Services;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Carbon\Carbon;
 use Exception;
 
 class DashboardService {
@@ -19,64 +20,140 @@ class DashboardService {
 
     public function index(Request $request) {
 
-            $clients = [];
-            $sales = [];
-            $summary = null;
+        $clients = [];
+        $sales = [];
+        $purchases = [];
+        $summary = null;
+        $activeClient = null;
 
-            $activeClientId = $request->get('client_id', session('active_client_id'));
+        $activeClientId = $request->get('client_id', session('active_client_id'));
 
-            if($activeClientId) {
-                session(['active_client_id' => $activeClientId]);
-            } else {
-                session()->forget('active_client_id');
-            }
+        if ($activeClientId) {
+            session(['active_client_id' => $activeClientId]);
+        } else {
+            session()->forget('active_client_id');
+        }
+
+        // Set default date range to current month
+        $startDate = $request->get('start_date', Carbon::now()->startOfMonth()->toDateString());
+        $endDate = $request->get('end_date', Carbon::now()->endOfMonth()->toDateString());
 
         try 
         {    
+            // 1. Fetch Clients
             $clientsResponse = Http::withoutVerifying()
-            ->withHeaders([
-                'apikey' => $this->key,
-                'Authorization' => 'Bearer ' . $this->key,
-            ])->get("{$this->url}/rest/v1/users", [
+            ->withHeaders($this->headers())
+            ->get("{$this->url}/rest/v1/users", [
                 'select' => '*',
-                'role' => 'eq.client',
+                'role'   => 'eq.client',
             ]);
 
-            if($clientsResponse->successful()){
+            if ($clientsResponse->successful()) {
                 $clients = $clientsResponse->json();
+
+                // ✅ Resolve activeClient AFTER fetching the clients list
+                $activeClient = collect($clients)->firstWhere('id', (int)$activeClientId) 
+                             ?? collect($clients)->firstWhere('id', (string)$activeClientId);
             }
             
+            // 2. Fetch Sales & Purchases for Selected Client & Date Range
             if ($activeClientId) {
+
+                // Fetch Sales
                 $salesResponse = Http::withoutVerifying()
-                ->withHeaders([
-                    'apikey' => $this->key,
-                    'Authorization' => 'Bearer ' . $this->key,
-                ])->get("{$this->url}/rest/v1/sales", [
-                    'select' => '*',
-                    'user_id' => 'eq.' . $activeClientId,
+                ->withHeaders($this->headers())
+                ->get("{$this->url}/rest/v1/sales", [
+                    'select'       => '*',
+                    'user_id'      => 'eq.' . $activeClientId,
+                    'invoice_date' => 'gte.' . $startDate,
+                    'and'          => '(invoice_date.lte.' . $endDate . ')',
                 ]);
                 
                 if ($salesResponse->successful()) {
                     $sales = $salesResponse->json();
                 }
-                
-                    $salesCollection = collect($sales);
-                    $summary = [
-                        'totalSales' => $salesCollection->sum('gross_amount'),
-                        'totalNet' => $salesCollection->sum('net_of_vat'),
-                        'outputVat' => $salesCollection->sum('output_vat'),
-                    ];
-            }
-            
 
-        } catch (\Exception $e) {
+                // Fetch Purchases
+                $purchasesResponse = Http::withoutVerifying()
+                ->withHeaders($this->headers())
+                ->get("{$this->url}/rest/v1/purchases", [
+                    'select'       => '*',
+                    'user_id'      => 'eq.' . $activeClientId,
+                    'invoice_date' => 'gte.' . $startDate,
+                    'and'          => '(invoice_date.lte.' . $endDate . ')',
+                ]);
+
+                if ($purchasesResponse->successful()) {
+                    $purchases = $purchasesResponse->json();
+                }
+
+                // 3. Attach Entity Names to Purchases
+                $entityIds = collect($purchases)->pluck('entity_id')->filter()->unique()->values()->all();
+
+                if (!empty($entityIds)) {
+                    $entitiesResp = Http::withoutVerifying()
+                    ->withHeaders($this->headers())
+                    ->get("{$this->url}/rest/v1/entities", [
+                        'select' => '*',
+                        'id'     => 'in.(' . implode(',', $entityIds) . ')',
+                    ]);
+
+                    if ($entitiesResp->successful()) {
+                        $entitiesMap = collect($entitiesResp->json() ?? [])->keyBy('id');
+                        
+                        // Map entity names cleanly using Collection .get()
+                        $purchases = collect($purchases)->map(function ($p) use ($entitiesMap) {
+                            $entity = $entitiesMap->get($p['entity_id'] ?? null);
+                            $p['entity_name'] = $entity['name'] ?? 'N/A';
+                            return $p;
+                        })->toArray();
+                    }
+                }
+                
+                $salesCollection = collect($sales);
+                $purchasesCollection = collect($purchases);
+
+                $outputVat = $salesCollection->sum('output_vat');
+                $inputVat = $purchasesCollection->sum('input_vat');
+                $vatPayable = $outputVat - $inputVat;
+
+                $summary = [
+                    'totalSales'       => $salesCollection->sum('gross_amount'),
+                    'totalNet'         => $salesCollection->sum('net_of_vat'),
+                    'outputVat'        => $outputVat,
+
+                    'totalPurchases'   => $purchasesCollection->sum('net_amount'),
+                    'taxablePurchases' => $purchasesCollection->sum('taxable_amount'),
+                    'inputVat'         => $inputVat,
+                    'taxWithheld'      => $purchasesCollection->sum('tax_withheld_2307'),
+                    'vatPayable'       => $vatPayable,
+                ];
+            }
+
+        } catch (Exception $e) {
             Log::warning("Failed to Fetch Data: " . $e->getMessage());
         }
 
-        
-        
+        return view('Admin.dashboard', compact(
+            'clients', 
+            'summary', 
+            'activeClientId',
+            'activeClient', 
+            'startDate', 
+            'endDate', 
+            'sales',      
+            'purchases'   
+        ));
+    }
 
-
-        return view('Admin.dashboard', compact('clients', 'summary', 'activeClientId'));
+    /**
+     * Helper method to supply Supabase headers
+     */
+    protected function headers(): array
+    {
+        return [
+            'apikey'        => $this->key,
+            'Authorization' => 'Bearer ' . $this->key,
+        ];
     }
 }
