@@ -4,7 +4,6 @@ namespace App\Services;
 
 use Barryvdh\DomPDF\Facade\Pdf;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\Log;
 use Carbon\Carbon;
 
 class QapPdfService
@@ -18,20 +17,38 @@ class QapPdfService
         $this->key = config('services.supabase.key');
     }
 
+    /**
+     * Generate QAP Report PDF for Standard 4 Quarters (3 months per quarter)
+     *
+     * @param string $userId      Client / User ID
+     * @param int    $quarter     Target Quarter (1, 2, 3, or 4)
+     * @param int    $year        Target Year
+     * @return \Illuminate\Http\Response
+     */
     public function generatePdf(string $userId, int $quarter, int $year)
     {
-        $startMonth = ($quarter - 1) * 3 + 1;
-        $startDate = Carbon::create($year, $startMonth, 1)->startOfMonth()->toDateString();
-        $endDate = Carbon::create($year, $startMonth + 2, 1)->endOfMonth()->toDateString();
+        // 1. Clamp Quarter strictly between 1 and 4
+        $quarter = max(1, min(4, $quarter));
 
-        // 1. Fetch User Details (Withholding Agent)
+        // 2. Calculate Start and End Dates for 3-Month Quarters
+        // Q1: Jan (1) - Mar (3)
+        // Q2: Apr (4) - Jun (6)
+        // Q3: Jul (7) - Sep (9)
+        // Q4: Oct (10) - Dec (12)
+        $startMonth = ($quarter - 1) * 3 + 1;
+        $endMonth   = $startMonth + 2;
+
+        $startDate = Carbon::create($year, $startMonth, 1)->startOfMonth()->toDateString();
+        $endDate   = Carbon::create($year, $endMonth, 1)->endOfMonth()->toDateString();
+
+        // 3. Fetch Withholding Agent Details
         $userResp = Http::withoutVerifying()->withHeaders($this->headers())->get("{$this->url}/rest/v1/users", [
             'select' => '*',
             'id'     => 'eq.' . $userId,
         ]);
         $user = $userResp->json()[0] ?? [];
 
-        // 2. Fetch Purchases for Quarter with Joined Entities
+        // 4. Fetch Quarter Purchases
         $purchasesResp = Http::withoutVerifying()->withHeaders($this->headers())->get("{$this->url}/rest/v1/purchases", [
             'select'       => '*, entities(*)',
             'user_id'      => 'eq.' . $userId,
@@ -42,59 +59,62 @@ class QapPdfService
 
         $purchases = collect($purchasesResp->json() ?? []);
 
-        // 3. Fetch Entities for TIN Lookup
-        $entitiesResp = Http::withoutVerifying()->withHeaders($this->headers())->get("{$this->url}/rest/v1/entities", [
-            'select'  => '*',
-            'user_id' => 'eq.' . $userId,
-        ]);
+        // 5. Service for Parsing TIN & Name
+        $dashboardService = new DashboardService();
 
-        $entitiesMap = collect();
-        if ($entitiesResp->successful()) {
-            $entitiesMap = collect($entitiesResp->json() ?? [])->keyBy(fn($item) => (int)$item['id']);
-        }
+        // 6. Group Purchases by Payee TIN & ATC Code
+        $grouped = $purchases->groupBy(function ($p) use ($dashboardService) {
+            $entity = $p['entities'] ?? $p['entity'] ?? [];
+            $rawSupplier = $p['tp_supplier_name'] ?? $p['supplier_name'] ?? $entity['name'] ?? 'UNKNOWN';
+            $parsed = $dashboardService->parseTinAndName($rawSupplier, $p['tin'] ?? $entity['tin'] ?? null);
+            
+            $tinKey = !empty($parsed['tin']) ? $parsed['tin'] : 'NO_TIN';
+            $atcKey = $p['atc_code'] ?? $p['atc'] ?? 'WC158';
 
-        // 4. Group Purchases by Entity and ATC Code
-        $grouped = $purchases->groupBy(fn($p) => ($p['entity_id'] ?? '0') . '_' . ($p['atc_code'] ?? 'WC158'));
+            return $tinKey . '_' . $atcKey;
+        });
+
         $rows = [];
 
+        // 7. Process Amounts Across the 3 Months of the Quarter
         foreach ($grouped as $items) {
             $first = $items->first();
-            $entityId = isset($first['entity_id']) ? (int)$first['entity_id'] : null;
+            $entity = $first['entities'] ?? $first['entity'] ?? [];
 
-            // Extract Entity Object for TIN and Corporate status
-            $entity = $first['entities'] 
-                   ?? $first['entity'] 
-                   ?? ($entityId ? $entitiesMap->get($entityId) : null)
-                   ?? [];
+            $rawSupplier = $first['tp_supplier_name'] ?? $first['supplier_name'] ?? $entity['name'] ?? 'UNSPECIFIED SUPPLIER';
+            $parsed = $dashboardService->parseTinAndName($rawSupplier, $first['tin'] ?? $entity['tin'] ?? null);
+
+            $supplierTin  = !empty($parsed['tin']) ? $parsed['tin'] : '000-000-000-00000';
+            $supplierName = strtoupper($parsed['name']);
 
             $isCorporate = isset($entity['is_corporate']) ? (bool)$entity['is_corporate'] : true;
-            $entityTin   = !empty($entity['tin']) ? $entity['tin'] : '000-000-000-0000';
 
-            // 🌟 Use particular_category instead of entity name
-            $categoryName = !empty($first['particular_category']) 
-                ? $first['particular_category'] 
-                : 'General Expense';
-
-            // Filter amounts by month
+            // Monthly breakdown across the 3 months
             $m1 = $items->filter(fn($p) => Carbon::parse($p['invoice_date'])->month == $startMonth);
             $m2 = $items->filter(fn($p) => Carbon::parse($p['invoice_date'])->month == ($startMonth + 1));
             $m3 = $items->filter(fn($p) => Carbon::parse($p['invoice_date'])->month == ($startMonth + 2));
 
-            $m1Amt = $m1->sum('taxable_amount'); $m1Tax = $m1->sum('tax_withheld_2307');
-            $m2Amt = $m2->sum('taxable_amount'); $m2Tax = $m2->sum('tax_withheld_2307');
-            $m3Amt = $m3->sum('taxable_amount'); $m3Tax = $m3->sum('tax_withheld_2307');
+            $m1Amt = $m1->sum(fn($p) => $p['taxable_amount'] ?? $p['taxable'] ?? 0);
+            $m1Tax = $m1->sum(fn($p) => $p['tax_withheld_2307'] ?? $p['tax_2307'] ?? 0);
+
+            $m2Amt = $m2->sum(fn($p) => $p['taxable_amount'] ?? $p['taxable'] ?? 0);
+            $m2Tax = $m2->sum(fn($p) => $p['tax_withheld_2307'] ?? $p['tax_2307'] ?? 0);
+
+            $m3Amt = $m3->sum(fn($p) => $p['taxable_amount'] ?? $p['taxable'] ?? 0);
+            $m3Tax = $m3->sum(fn($p) => $p['tax_withheld_2307'] ?? $p['tax_2307'] ?? 0);
 
             $totQuarterAmt = $m1Amt + $m2Amt + $m3Amt;
             $totQuarterTax = $m1Tax + $m2Tax + $m3Tax;
 
-            $rawRate = $first['tax_rate'] ?? 0.0100;
-            $formattedRate = ($rawRate * 100) . '%';
+            // Determine Tax Rate
+            $rawRate = $first['tax_rate'] ?? $first['rate'] ?? 0.01;
+            $formattedRate = is_numeric($rawRate) ? ($rawRate <= 1 ? ($rawRate * 100) . '%' : $rawRate . '%') : $rawRate;
 
             $rows[] = [
-                'tin'               => $entityTin,
-                'corp_name'         => $isCorporate ? $categoryName : '',
-                'ind_name'          => !$isCorporate ? $categoryName : '',
-                'atc'               => $first['atc_code'] ?? 'WC158',
+                'tin'               => $supplierTin,
+                'corp_name'         => $isCorporate ? $supplierName : '',
+                'ind_name'          => !$isCorporate ? $supplierName : '',
+                'atc'               => $first['atc_code'] ?? $first['atc'] ?? 'WC158',
                 'tax_rate'          => $formattedRate,
                 'm1_amt'            => $m1Amt, 'm1_tax' => $m1Tax,
                 'm2_amt'            => $m2Amt, 'm2_tax' => $m2Tax,
@@ -104,7 +124,7 @@ class QapPdfService
             ];
         }
 
-        $quarterName = strtoupper(Carbon::create($year, $startMonth + 2, 1)->format('F, Y'));
+        $quarterName = strtoupper(Carbon::create($year, $endMonth, 1)->format('F, Y'));
 
         $data = [
             'user'          => $user,
