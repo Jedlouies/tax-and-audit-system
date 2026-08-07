@@ -31,10 +31,6 @@ class QapPdfService
         $quarter = max(1, min(4, $quarter));
 
         // 2. Calculate Start and End Dates for 3-Month Quarters
-        // Q1: Jan (1) - Mar (3)
-        // Q2: Apr (4) - Jun (6)
-        // Q3: Jul (7) - Sep (9)
-        // Q4: Oct (10) - Dec (12)
         $startMonth = ($quarter - 1) * 3 + 1;
         $endMonth   = $startMonth + 2;
 
@@ -123,6 +119,11 @@ class QapPdfService
                 'quarter_total_tax' => $totQuarterTax,
             ];
         }
+
+        // 8. Sort Rows Alphabetically by Payee Name (Corporate or Individual)
+        $rows = collect($rows)->sortBy(function ($row) {
+            return !empty($row['corp_name']) ? $row['corp_name'] : $row['ind_name'];
+        }, SORT_NATURAL | SORT_FLAG_CASE)->values()->toArray();
 
         $quarterName = strtoupper(Carbon::create($year, $endMonth, 1)->format('F, Y'));
 

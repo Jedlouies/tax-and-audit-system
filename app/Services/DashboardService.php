@@ -19,7 +19,7 @@ class DashboardService {
     }
 
     /**
-     * Helper to parse combined "TIN Name" strings if TIN is included in supplier name.
+     * Helper to parse combined "TIN Name" strings if TIN is included in supplier/customer name.
      */
     public function parseTinAndName(?string $rawSupplier, ?string $fallbackTin = null): array
     {
@@ -43,6 +43,7 @@ class DashboardService {
         $clients = [];
         $sales = [];
         $purchases = [];
+        $payroll = [];
         $summary = null;
         $activeClient = null;
 
@@ -54,7 +55,7 @@ class DashboardService {
             session()->forget('active_client_id');
         }
 
-        // Set default date range to current month
+        // Default date range: current month
         $startDate = $request->get('start_date', Carbon::now()->startOfMonth()->toDateString());
         $endDate = $request->get('end_date', Carbon::now()->endOfMonth()->toDateString());
 
@@ -74,10 +75,9 @@ class DashboardService {
                              ?? collect($clients)->firstWhere('id', (string)$activeClientId);
             }
             
-            // 2. Fetch Sales & Purchases for Selected Client & Date Range
             if ($activeClientId) {
 
-                // Fetch Sales
+                // 2. Fetch Sales
                 $salesResponse = Http::withoutVerifying()
                 ->withHeaders($this->headers())
                 ->get("{$this->url}/rest/v1/sales", [
@@ -86,17 +86,11 @@ class DashboardService {
                     'invoice_date' => 'gte.' . $startDate,
                     'and'          => '(invoice_date.lte.' . $endDate . ')',
                 ]);
-                
                 if ($salesResponse->successful()) {
-                    $sales = collect($salesResponse->json())->map(function ($s) {
-                        $parsed = $this->parseTinAndName($s['supplier_name'] ?? $s['customer_name'] ?? '', $s['tin'] ?? null);
-                        $s['parsed_tin'] = $parsed['tin'];
-                        $s['parsed_name'] = $parsed['name'];
-                        return $s;
-                    })->toArray();
+                    $sales = $salesResponse->json();
                 }
 
-                // Fetch Purchases
+                // 3. Fetch Purchases
                 $purchasesResponse = Http::withoutVerifying()
                 ->withHeaders($this->headers())
                 ->get("{$this->url}/rest/v1/purchases", [
@@ -105,21 +99,64 @@ class DashboardService {
                     'invoice_date' => 'gte.' . $startDate,
                     'and'          => '(invoice_date.lte.' . $endDate . ')',
                 ]);
-
                 if ($purchasesResponse->successful()) {
                     $purchases = $purchasesResponse->json();
                 }
 
-                // 3. Attach Entity Names to Purchases
-                $entityIds = collect($purchases)->pluck('entity_id')->filter()->unique()->values()->all();
+                // 4. Fetch Employees
+                $employeesResponse = Http::withoutVerifying()
+                ->withHeaders($this->headers())
+                ->get("{$this->url}/rest/v1/employees", [
+                    'select'  => '*',
+                    'user_id' => 'eq.' . $activeClientId,
+                ]);
+
+                $employeesMap = collect();
+                if ($employeesResponse->successful()) {
+                    $employeesMap = collect($employeesResponse->json())->keyBy('id');
+                }
+
+                // 5. Fetch Payroll Entries
+                $employeeIds = $employeesMap->keys()->all();
+                if (!empty($employeeIds)) {
+                    $payrollResponse = Http::withoutVerifying()
+                    ->withHeaders($this->headers())
+                    ->get("{$this->url}/rest/v1/payroll_entries", [
+                        'select'      => '*',
+                        'employee_id' => 'in.(' . implode(',', $employeeIds) . ')',
+                        'period_date' => 'gte.' . $startDate,
+                        'and'         => '(period_date.lte.' . $endDate . ')',
+                    ]);
+
+                    if ($payrollResponse->successful()) {
+                        $payroll = collect($payrollResponse->json())->map(function ($p) use ($employeesMap) {
+                            $emp = $employeesMap->get($p['employee_id'] ?? null);
+                            $p['full_name'] = $emp['full_name'] ?? 'N/A';
+                            $p['position']  = $emp['position'] ?? '-';
+                            $p['tin']       = $emp['tin'] ?? '-';
+                            $p['is_mwe']    = $emp['is_mwe'] ?? false;
+                            return $p;
+                        })
+                        ->sortBy('full_name', SORT_NATURAL | SORT_FLAG_CASE)
+                        ->values()
+                        ->toArray();
+                    }
+                }
+
+                // 6. Map Entities and Branches into Sales & Purchases
+                $salesEntityIds = collect($sales)->pluck('entity_id')->filter()->toArray();
+                $purchasesEntityIds = collect($purchases)->pluck('entity_id')->filter()->toArray();
+                $allEntityIds = array_unique(array_merge($salesEntityIds, $purchasesEntityIds));
+
+                $branchIds = collect($sales)->pluck('branch_id')->filter()->unique()->values()->all();
 
                 $entitiesMap = collect();
-                if (!empty($entityIds)) {
+                if (!empty($allEntityIds)) {
                     $entitiesResp = Http::withoutVerifying()
                     ->withHeaders($this->headers())
                     ->get("{$this->url}/rest/v1/entities", [
                         'select' => '*',
-                        'id'     => 'in.(' . implode(',', $entityIds) . ')',
+                        'id'     => 'in.(' . implode(',', $allEntityIds) . ')',
                     ]);
 
                     if ($entitiesResp->successful()) {
@@ -127,6 +164,39 @@ class DashboardService {
                     }
                 }
 
+                $branchesMap = collect();
+                if (!empty($branchIds)) {
+                    $branchesResp = Http::withoutVerifying()
+                    ->withHeaders($this->headers())
+                    ->get("{$this->url}/rest/v1/branches", [
+                        'select' => '*',
+                        'id'     => 'in.(' . implode(',', $branchIds) . ')',
+                    ]);
+
+                    if ($branchesResp->successful()) {
+                        $branchesMap = collect($branchesResp->json() ?? [])->keyBy('id');
+                    }
+                }
+
+                // Format & Sort Sales Alphabetically
+                $sales = collect($sales)->map(function ($s) use ($entitiesMap, $branchesMap) {
+                    $entity = $entitiesMap->get($s['entity_id'] ?? null);
+                    $branch = $branchesMap->get($s['branch_id'] ?? null);
+
+                    $rawName = $s['supplier_name'] ?? $s['customer_name'] ?? $entity['name'] ?? 'N/A';
+                    $parsed = $this->parseTinAndName($rawName, $s['tin'] ?? $entity['tin'] ?? null);
+
+                    $s['parsed_tin'] = $parsed['tin'];
+                    $s['parsed_name'] = $parsed['name'];
+                    $s['customer_name'] = $parsed['name'];
+                    $s['branch'] = $branch['branch_name'] ?? 'MAIN';
+                    return $s;
+                })
+                ->sortBy('parsed_name', SORT_NATURAL | SORT_FLAG_CASE)
+                ->values()
+                ->toArray();
+
+                // Format & Sort Purchases Alphabetically
                 $purchases = collect($purchases)->map(function ($p) use ($entitiesMap) {
                     $entity = $entitiesMap->get($p['entity_id'] ?? null);
                     $rawName = $p['tp_supplier_name'] ?? $p['supplier_name'] ?? $entity['name'] ?? 'N/A';
@@ -136,8 +206,12 @@ class DashboardService {
                     $p['parsed_name'] = $parsed['name'];
                     $p['entity_name'] = $parsed['name'];
                     return $p;
-                })->toArray();
+                })
+                ->sortBy('parsed_name', SORT_NATURAL | SORT_FLAG_CASE)
+                ->values()
+                ->toArray();
 
+                // 7. Calculate Financial Summaries
                 $salesCollection = collect($sales);
                 $purchasesCollection = collect($purchases);
 
@@ -170,7 +244,8 @@ class DashboardService {
             'startDate', 
             'endDate', 
             'sales',      
-            'purchases'   
+            'purchases',
+            'payroll'
         ));
     }
 

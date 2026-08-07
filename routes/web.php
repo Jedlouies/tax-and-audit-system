@@ -11,8 +11,10 @@ Route::get('/', function () {
 });
 
 Route::post('/login', [AuthController::class, 'login'])->name('login');
+Route::post('/logout', [AuthController::class, 'logout'])->name('logout');
 
 Route::get('/dashboard', [DashboardController::class, 'index'])->name('dashboard');
 Route::get('/reports/vat-pdf', [ReportController::class, 'exportVatPdf'])->name('reports.vat_pdf');
-Route::get('/reports/slsp-excel', [ReportController::class, 'exportSlspExcel'])->name('reports.slsp_excel');
+Route::get('/reports/wtax-expanded-pdf', [ReportController::class, 'exportWTaxExpandedPdf'])->name('reports.wtax_expanded_pdf');
 Route::get('/reports/qap-pdf', [ReportController::class, 'exportQapPdf'])->name('reports.qap_pdf');
+

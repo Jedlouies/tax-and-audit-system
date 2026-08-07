@@ -2,10 +2,11 @@
 
 namespace App\Http\Controllers;
 
-use App\Services\PdfReportService;
+use App\Services\VatReportPdfService;
 use App\Services\QapPdfService;
+use App\Services\WTaxExpandedPdfService;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Http;
+use Carbon\Carbon;
 
 class ReportController extends Controller
 {
@@ -14,33 +15,55 @@ class ReportController extends Controller
 
     public function __construct()
     {
-        $this->url = config('services.supabase.url');
-        $this->key = config('services.supabase.key');
+        $this->url = rtrim(config('services.supabase.url') ?? '', '/');
+        $this->key = config('services.supabase.key') ?? '';
     }
 
-    public function exportVatPdf(Request $request, PdfReportService $pdfService)
+    /**
+     * Export VAT Summary Report (PDF)
+     */
+    public function exportVatPdf(Request $request, VatReportPdfService $vatReportPdfService)
     {
-        $clientId = $request->get('client_id');
+        $clientId  = $request->get('client_id', session('active_client_id'));
         $startDate = $request->get('start_date');
-        $endDate = $request->get('end_date');
+
+        // Derive year from start_date or default to current year
+        $year = !empty($startDate) ? (int) Carbon::parse($startDate)->year : (int) date('Y');
 
         if (!$clientId) {
             return redirect()->back()->with('error', 'Please select a client.');
         }
 
-        return $pdfService->generateVatReport($clientId, $startDate, $endDate);
+        return $vatReportPdfService->generatePdf($clientId, $year);
     }
 
+    /**
+     * Export Quarterly Alphalist of Payees (QAP PDF)
+     */
     public function exportQapPdf(Request $request, QapPdfService $qapPdfService)
     {
         $clientId = $request->get('client_id', session('active_client_id'));
-        $quarter = (int) $request->get('quarter', ceil(now()->month / 3));
-        $year = (int) $request->get('year', now()->year);
+        $quarter  = (int) $request->get('quarter', ceil(now()->month / 3));
+        $year     = (int) $request->get('year', now()->year);
 
         if (!$clientId) {
             return redirect()->back()->with('error', 'Please select a client.');
         }
 
         return $qapPdfService->generatePdf($clientId, $quarter, $year);
+    }
+
+    public function exportWTaxExpandedPdf(Request $request, WTaxExpandedPdfService $wTaxPdfService)
+    {
+        $clientId  = $request->get('client_id', session('active_client_id'));
+        $startDate = $request->get('start_date');
+
+        $year = !empty($startDate) ? (int) Carbon::parse($startDate)->year : (int) date('Y');
+
+        if (!$clientId) {
+            return redirect()->back()->with('error', 'Please select a client.');
+        }
+
+        return $wTaxPdfService->generatePdf($clientId, $year);
     }
 }
